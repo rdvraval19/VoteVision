@@ -1,199 +1,114 @@
 # app/routers/elections.py
-from fastapi import APIRouter, HTTPException, Query, status, Path
-from typing import Optional, List
-from datetime import date, datetime
 
+from fastapi import APIRouter, HTTPException, Depends, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from typing import List, Optional
+
+from app.database import get_db
+from app.db_models.election import Election
 from app.models.election import (
     ElectionCreate,
     ElectionResponse,
     ElectionStatus,
-    ElectionSummaryResponse,        # ← NEW
-)
-from app.services.summarizer import generate_election_summary  # ← NEW
-
-# --- Router Initialization ---
-# prefix: all routes in this file automatically start with /elections
-# tags: groups these routes together in the /docs UI
-router = APIRouter(
-    prefix="/elections",
-    tags=["Elections"],
+    ElectionSummaryResponse
 )
 
-
-# --- In-Memory Data Store ---
-# We're using a plain Python list as our "database" for now.
-# This is intentional — we want the API working before adding
-# database complexity. We'll swap this for PostgreSQL later.
-_elections_db: List[dict] = [
-    {
-        "id": 1,
-        "name": "2024 Indian General Election",
-        "country": "India",
-        "election_type": "general",
-        "election_date": "2024-04-19",
-        "description": "18th General Election to the Lok Sabha.",
-        "status": "completed",
-    },
-    {
-        "id": 2,
-        "name": "2025 Delhi Assembly Election",
-        "country": "India",
-        "election_type": "state",
-        "election_date": "2025-02-05",
-        "description": "Election to the 8th Delhi Legislative Assembly.",
-        "status": "completed",
-    },
-]
-
-# Tracks the next available ID (mimics auto-increment in a real DB)
-_next_id = 3
+router = APIRouter(prefix="/elections", tags=["Elections"])
 
 
-# ─────────────────────────────────────────────
-# GET /elections
-# Returns all elections, with optional status filter
-# ─────────────────────────────────────────────
+# ── Helper ──────────────────────────────────────────────────────────────────
+async def get_election_or_404(election_id: int, db: AsyncSession) -> Election:
+    """Reusable helper — fetches an election or raises 404."""
+    result = await db.execute(select(Election).where(Election.id == election_id))
+    election = result.scalar_one_or_none()
+    if not election:
+        raise HTTPException(status_code=404, detail=f"Election {election_id} not found")
+    return election
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 @router.get("/", response_model=List[ElectionResponse])
-def get_all_elections(
-    status: ElectionStatus | None = Query(
-        default=None,
-        description="Filter elections by status: upcoming, ongoing, or completed",
-    )
+async def list_elections(
+    status: Optional[ElectionStatus] = None,
+    db: AsyncSession = Depends(get_db)         # DB session injected here
 ):
-    """
-    Retrieve all tracked elections.
-    Optionally filter by status using the `?status=` query parameter.
-    """
+    """List all elections, optionally filtered by status."""
+    query = select(Election)
     if status:
-        filtered = [e for e in _elections_db if e["status"] == status.value]
-        return filtered
-    return _elections_db
+        query = query.where(Election.status == status)
+
+    result = await db.execute(query)
+    elections = result.scalars().all()         # .scalars() extracts the ORM objects
+    return elections
 
 
-# ─────────────────────────────────────────────
-# GET /elections/{election_id}
-# Returns a single election by ID
-# ─────────────────────────────────────────────
 @router.get("/{election_id}", response_model=ElectionResponse)
-def get_election(
-    election_id: int = Path(
-        ...,
-        gt=0,
-        description="The unique ID of the election to retrieve",
-    )
+async def get_election(
+    election_id: int,
+    db: AsyncSession = Depends(get_db)
 ):
-    """
-    Retrieve a specific election by its ID.
-    Returns 404 if not found.
-    """
-    for election in _elections_db:
-        if election["id"] == election_id:
-            return election
-
-    # Raising HTTPException is the FastAPI way to return error responses.
-    # It automatically formats the response as {"detail": "..."} with the correct status code.
-    raise HTTPException(
-        status_code=404,
-        detail=f"Election with ID {election_id} not found.",
-    )
+    """Get a single election by ID."""
+    return await get_election_or_404(election_id, db)
 
 
-# ─────────────────────────────────────────────
-# POST /elections
-# Creates a new election entry
-# ─────────────────────────────────────────────
-@router.post("/", response_model=ElectionResponse, status_code=201)
-def create_election(payload: ElectionCreate):
-    """
-    Register a new election in the platform.
-    Accepts election details and returns the created record with its assigned ID.
-    """
-    global _next_id
-
-    new_election = {
-        "id": _next_id,
-        **payload.model_dump(),  # Unpacks all validated fields from the request body
-        "status": ElectionStatus.upcoming.value,
-        "election_date": str(payload.election_date),
-    }
-
-    _elections_db.append(new_election)
-    _next_id += 1
-
+@router.post("/", response_model=ElectionResponse, status_code=status.HTTP_201_CREATED)
+async def create_election(
+    payload: ElectionCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new election."""
+    # Convert Pydantic model → SQLAlchemy model
+    new_election = Election(**payload.model_dump())
+    db.add(new_election)
+    await db.flush()        # sends INSERT to DB, populates new_election.id
+    await db.refresh(new_election)  # re-reads the row so created_at etc are populated
     return new_election
 
 
-# ─────────────────────────────────────────────
-# DELETE /elections/{election_id}
-# Removes an election by ID
-# ─────────────────────────────────────────────
-@router.delete("/{election_id}", status_code=204)
-def delete_election(
-    election_id: int = Path(
-        ...,
-        gt=0,
-        description="The unique ID of the election to delete",
-    )
+@router.delete("/{election_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_election(
+    election_id: int,
+    db: AsyncSession = Depends(get_db)
 ):
-    """
-    Remove an election from the platform by ID.
-    Returns 204 No Content on success, 404 if not found.
-    """
-    global _elections_db
+    """Delete an election by ID."""
+    election = await get_election_or_404(election_id, db)
+    await db.delete(election)
+    # commit happens automatically in get_db() when the request finishes
 
-    for index, election in enumerate(_elections_db):
-        if election["id"] == election_id:
-            _elections_db.pop(index)
-            return  # 204 returns no body
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"Election with ID {election_id} not found.",
+@router.post("/{election_id}/summarize", response_model=ElectionSummaryResponse)
+async def summarize_election(
+    election_id: int,
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate an AI summary for an election using Groq."""
+    from app.db_models.candidate import Candidate
+    from app.db_models.news import NewsArticle
+    from app.services.summarizer import generate_election_summary
+
+    election = await get_election_or_404(election_id, db)
+
+    # Fetch related candidates
+    cand_result = await db.execute(
+        select(Candidate).where(Candidate.election_id == election_id)
     )
+    candidates = cand_result.scalars().all()
 
-
-@router.post(
-    "/{election_id}/summarize",
-    response_model=ElectionSummaryResponse,
-    tags=["AI"],
-    summary="Generate an AI summary for this election",
-)
-def summarize_election(election_id: int):
-    """
-    Calls GPT-4o-mini to produce a structured briefing for this election.
-    Pulls all matching candidates and news articles automatically.
-    """
-    # ── Step 1: confirm the election exists ──
-    election = next(
-        (e for e in _elections_db if e["id"] == election_id), None
+    # Fetch related news articles
+    news_result = await db.execute(
+        select(NewsArticle).where(NewsArticle.election_id == election_id)
     )
-    if not election:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Election with id={election_id} not found.",
-        )
+    articles = news_result.scalars().all()
 
-    # ── Step 2: import the in-memory DBs from other routers ──
-    # We import here (not at the top) to avoid circular import errors.
-    from app.routers.candidates import _candidates_db
-    from app.routers.news import _news_db
+    # Build plain dicts for the summarizer service (keeps service layer DB-agnostic)
+    candidate_dicts = [{"name": c.name, "party": c.party.value} for c in candidates]
+    article_dicts = [{"headline": a.headline, "source": a.source} for a in articles]
 
-    # ── Step 3: filter candidates and news for this election ──
-    candidates = [
-        c for c in _candidates_db
-        if c.get("election_id") == election_id
-    ]
-    articles = [
-        a for a in _news_db.values()
-        if a.get("election_id") == election_id
-    ]
-
-    # ── Step 4: call the summarizer service ──
-    result = generate_election_summary(
+    summary = await generate_election_summary(
         election_id=election_id,
-        election_name=election["name"],
-        candidates=candidates,
-        articles=articles,
+        election_name=election.name,
+        candidates=candidate_dicts,
+        articles=article_dicts
     )
-
-    return result
+    return summary

@@ -1,8 +1,7 @@
 # app/main.py
 
 from fastapi import FastAPI
-from app.routers import elections, candidates
-from app.routers import news   # ← ADD THIS
+from app.routers import elections, candidates, news, realtime
 
 app = FastAPI(
     title="VoteVision — Election Intelligence Platform",
@@ -13,6 +12,7 @@ app = FastAPI(
 app.include_router(elections.router)
 app.include_router(candidates.router)
 app.include_router(news.router)   # ← ADD THIS
+app.include_router(realtime.router)
 
 @app.get("/", tags=["Health"])
 def root():

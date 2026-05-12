@@ -1,9 +1,8 @@
-# app/models/news.py
-
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 from enum import Enum
 from datetime import datetime
+
 
 # ─────────────────────────────────────────
 # ENUMS
@@ -11,69 +10,109 @@ from datetime import datetime
 
 class CredibilityLabel(str, Enum):
     """
-    The three possible outcomes of fake-news detection.
-    'str' mixin means the value IS the string (e.g. "credible"),
-    which makes JSON serialization automatic.
+    Possible outcomes of fake-news detection.
     """
-    credible    = "credible"
-    misleading  = "misleading"
-    fake        = "fake"
+    credible = "credible"
+    misleading = "misleading"
+    fake = "fake"
 
 
 # ─────────────────────────────────────────
-# NESTED RESULT MODELS (used inside NewsResponse)
+# NESTED AI RESULT MODELS
 # ─────────────────────────────────────────
 
 class SentimentResult(BaseModel):
-    """Mirrors the SentimentResult in candidate.py — reused here for news."""
-    label:         str   # "positive", "negative", or "neutral"
-    score:         float # confidence from 0.0 to 1.0
-    analyzed_text: str   # the text that was actually sent to the model
+    """
+    Sentiment analysis response structure.
+    """
+    label: str
+    score: float
+    analyzed_text: str
 
 
 class FakeNewsResult(BaseModel):
-    """What the fake-news detection service returns."""
-    label:         CredibilityLabel  # credible / misleading / fake
-    score:         float             # confidence from 0.0 to 1.0
-    analyzed_text: str               # text sent to the model
+    """
+    Fake news analysis response structure.
+    """
+    label: CredibilityLabel
+    score: float
+    analyzed_text: str
 
 
 # ─────────────────────────────────────────
-# CORE MODELS
+# BASE MODEL
 # ─────────────────────────────────────────
 
 class NewsBase(BaseModel):
     """
-    Shared fields between Create and Response.
-    Never use this directly in a route — only subclass it.
+    Shared fields for NewsCreate and NewsResponse.
     """
-    headline:    str = Field(..., min_length=5,   max_length=300)
-    content:     str = Field(..., min_length=20,  max_length=5000)
-    source:      str = Field(..., min_length=2,   max_length=100)
-    url:         Optional[str] = None
-    election_id: Optional[int] = None  # links article to an election
 
+    headline: str = Field(
+        ...,
+        min_length=5,
+        max_length=500
+    )
+
+    content: str = Field(
+        ...,
+        min_length=10,
+        max_length=5000
+    )
+
+    source: Optional[str] = Field(
+        default=None,
+        max_length=200
+    )
+
+    url: Optional[str] = Field(
+        default=None,
+        max_length=500
+    )
+
+    election_id: Optional[int] = None
+
+
+# ─────────────────────────────────────────
+# CREATE MODEL
+# ─────────────────────────────────────────
 
 class NewsCreate(NewsBase):
     """
-    What the client sends in the POST /news/ request body.
-    No 'id', no AI results — those are server-side.
+    Request body for creating a news article.
     """
-    pass  # inherits everything from NewsBase
+    pass
 
+
+# ─────────────────────────────────────────
+# RESPONSE MODEL
+# ─────────────────────────────────────────
 
 class NewsResponse(NewsBase):
     """
-    What the API returns. Includes server-generated fields
-    and optional AI analysis results (None until /analyze is called).
+    Full API response model for news articles.
+    Includes AI analysis results.
     """
-    id:              int
-    created_at:      datetime
 
-    # These are None until POST /news/{id}/analyze is called
-    credibility:     Optional[CredibilityLabel] = None
-    sentiment:       Optional[SentimentResult]  = None
-    fake_news:       Optional[FakeNewsResult]   = None
+    id: int
 
-    # Pydantic v2: enables reading from ORM objects / dicts
-    model_config = {"from_attributes": True}
+    # AI Analysis Fields
+    credibility: Optional[CredibilityLabel] = None
+    credibility_score: Optional[float] = None
+
+    sentiment_label: Optional[str] = None
+    sentiment_score: Optional[float] = None
+
+    fake_news_label: Optional[str] = None
+    fake_news_score: Optional[float] = None
+
+    # Optional detailed nested objects
+    sentiment: Optional[SentimentResult] = None
+    fake_news: Optional[FakeNewsResult] = None
+
+    # Metadata
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    # Pydantic v2 ORM compatibility
+    model_config = ConfigDict(from_attributes=True)

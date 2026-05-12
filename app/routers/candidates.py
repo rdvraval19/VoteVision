@@ -1,166 +1,190 @@
-# app/routers/candidates.py
-
-from fastapi import APIRouter, HTTPException, Path, Query
+from fastapi import APIRouter, HTTPException, Depends, status, Path, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from typing import List, Optional
+
+from app.database import get_db
+from app.db_models.candidate import Candidate
+from app.db_models.election import Election
+
 from app.models.candidate import (
     CandidateCreate,
     CandidateResponse,
     CandidateStatus,
-    SentimentResult,
+    PoliticalParty,
 )
-from app.services.sentiment import analyze_sentiment
+
+from app.services.sentiment import analyze_sentiment as run_sentiment
 
 router = APIRouter(
     prefix="/candidates",
     tags=["Candidates"],
 )
 
-# --- In-Memory Store ---
-_candidates_db: List[dict] = [
-    {
-        "id": 1,
-        "name": "Narendra Modi",
-        "party": "BJP",
-        "constituency": "Varanasi",
-        "election_id": 1,
-        "bio": "14th Prime Minister of India.",
-        "status": "active",
-        "sentiment": None,
-    },
-    {
-        "id": 2,
-        "name": "Rahul Gandhi",
-        "party": "INC",
-        "constituency": "Wayanad",
-        "election_id": 1,
-        "bio": "Leader of the Indian National Congress.",
-        "status": "active",
-        "sentiment": None,
-    },
-]
 
-_next_id = 3
+# ─────────────────────────────────────────────
+# Helper Function
+# ─────────────────────────────────────────────
+async def get_candidate_or_404(
+    candidate_id: int,
+    db: AsyncSession
+) -> Candidate:
+
+    result = await db.execute(
+        select(Candidate).where(Candidate.id == candidate_id)
+    )
+
+    candidate = result.scalar_one_or_none()
+
+    if not candidate:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Candidate with ID {candidate_id} not found."
+        )
+
+    return candidate
 
 
 # ─────────────────────────────────────────────
 # GET /candidates
-# Returns all candidates, with optional filters
+# Returns all candidates with optional filters
 # ─────────────────────────────────────────────
 @router.get("/", response_model=List[CandidateResponse])
-def get_all_candidates(
+async def get_all_candidates(
     election_id: Optional[int] = Query(
         default=None,
         description="Filter candidates by election ID",
     ),
-    party: Optional[str] = Query(
+    party: Optional[PoliticalParty] = Query(
         default=None,
-        description="Filter candidates by party name",
+        description="Filter candidates by political party",
     ),
+    db: AsyncSession = Depends(get_db),
 ):
     """Retrieve all candidates with optional filters."""
-    results = _candidates_db
+
+    query = select(Candidate)
 
     if election_id:
-        results = [c for c in results if c["election_id"] == election_id]
-    if party:
-        results = [c for c in results if c["party"].lower() == party.lower()]
+        query = query.where(Candidate.election_id == election_id)
 
-    return results
+    if party:
+        query = query.where(Candidate.party == party)
+
+    result = await db.execute(query)
+
+    return result.scalars().all()
 
 
 # ─────────────────────────────────────────────
 # GET /candidates/{candidate_id}
-# Returns a single candidate by ID
+# Returns a single candidate
 # ─────────────────────────────────────────────
 @router.get("/{candidate_id}", response_model=CandidateResponse)
-def get_candidate(
+async def get_candidate(
     candidate_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Retrieve a specific candidate by their ID."""
-    for candidate in _candidates_db:
-        if candidate["id"] == candidate_id:
-            return candidate
+    """Retrieve a specific candidate by ID."""
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"Candidate with ID {candidate_id} not found.",
-    )
+    return await get_candidate_or_404(candidate_id, db)
 
 
 # ─────────────────────────────────────────────
 # POST /candidates
-# Register a new candidate
+# Create a new candidate
 # ─────────────────────────────────────────────
-@router.post("/", response_model=CandidateResponse, status_code=201)
-def create_candidate(payload: CandidateCreate):
+@router.post(
+    "/",
+    response_model=CandidateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_candidate(
+    payload: CandidateCreate,
+    db: AsyncSession = Depends(get_db),
+):
     """Register a new candidate in the platform."""
-    global _next_id
 
-    new_candidate = {
-        "id": _next_id,
+    # Verify election exists
+    election_result = await db.execute(
+        select(Election).where(Election.id == payload.election_id)
+    )
+
+    election = election_result.scalar_one_or_none()
+
+    if not election:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Election {payload.election_id} not found."
+        )
+
+    new_candidate = Candidate(
         **payload.model_dump(),
-        "status": CandidateStatus.active.value,
-        "sentiment": None,
-    }
+        status=CandidateStatus.active.value,
+    )
 
-    _candidates_db.append(new_candidate)
-    _next_id += 1
+    db.add(new_candidate)
+
+    await db.commit()
+    await db.refresh(new_candidate)
 
     return new_candidate
 
 
 # ─────────────────────────────────────────────
 # POST /candidates/{candidate_id}/analyze-sentiment
-# THE AI ENDPOINT — runs sentiment analysis on provided text
+# AI Sentiment Analysis
 # ─────────────────────────────────────────────
-@router.post("/{candidate_id}/analyze-sentiment", response_model=CandidateResponse)
-def analyze_candidate_sentiment(
+@router.post(
+    "/{candidate_id}/analyze-sentiment",
+    response_model=CandidateResponse,
+)
+async def analyze_candidate_sentiment(
     candidate_id: int = Path(..., gt=0),
     text: str = Query(
         ...,
         min_length=5,
         max_length=512,
-        description="Text to analyze — a news headline, tweet, or speech excerpt about the candidate",
+        description="Text to analyze — tweet, speech, article, etc.",
     ),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Run AI-powered sentiment analysis on any text related to a candidate.
-
-    The result is stored on the candidate record and returned in the response.
-    This endpoint powers VoteVision's public perception tracking feature.
+    Run AI-powered sentiment analysis on candidate-related text.
     """
-    # Find the candidate
-    for candidate in _candidates_db:
-        if candidate["id"] == candidate_id:
 
-            # Call the AI service
-            sentiment_result = analyze_sentiment(text)
+    candidate = await get_candidate_or_404(candidate_id, db)
 
-            # Store the result on the candidate record
-            candidate["sentiment"] = sentiment_result
+    # Run AI sentiment analysis
+    sentiment_result = run_sentiment(text)
 
-            return candidate
+    # Save AI results into DB
+    candidate.sentiment_label = sentiment_result["label"]
+    candidate.sentiment_score = sentiment_result["score"]
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"Candidate with ID {candidate_id} not found.",
-    )
+    await db.commit()
+    await db.refresh(candidate)
+
+    return candidate
 
 
 # ─────────────────────────────────────────────
 # DELETE /candidates/{candidate_id}
+# Delete candidate
 # ─────────────────────────────────────────────
-@router.delete("/{candidate_id}", status_code=204)
-def delete_candidate(candidate_id: int = Path(..., gt=0)):
-    """Remove a candidate from the platform."""
-    global _candidates_db
+@router.delete(
+    "/{candidate_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_candidate(
+    candidate_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a candidate."""
 
-    for index, candidate in enumerate(_candidates_db):
-        if candidate["id"] == candidate_id:
-            _candidates_db.pop(index)
-            return
+    candidate = await get_candidate_or_404(candidate_id, db)
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"Candidate with ID {candidate_id} not found.",
-    )
+    await db.delete(candidate)
+    await db.commit()
+
+    return
